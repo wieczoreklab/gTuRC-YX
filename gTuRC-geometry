@@ -1,0 +1,372 @@
+#this file contains functions to define and calculate differences
+#in orientation and opening of gammaTurcs
+import numpy as np
+import sys
+import Bio
+import Bio.PDB
+import Bio.SeqRecord
+import pandas as pd
+import os,glob
+from collections import defaultdict
+
+def calculate_center_of_mass(coordinates):
+    """
+    Calculates the center of mass for a given set of coordinates.
+    
+    Parameters:
+        coordinates (np.ndarray): Array of coordinates (x, y, z).
+    
+    Returns:
+        np.ndarray: Coordinates of the center of mass.
+    """
+    # Calculate the total mass (number of coordinates)
+    total_mass = len(coordinates)
+    
+    # Calculate the weighted sum of the coordinates
+    weighted_sum = np.sum(coordinates, axis=0)
+    
+    # Calculate the center of mass by dividing the weighted sum by the total mass
+    center_of_mass = weighted_sum / total_mass
+    
+    return center_of_mass
+ 
+def cartesian_to_cylindrical(cartesian_coords):
+    """
+    Converts Cartesian coordinates to cylindrical coordinates.
+    
+    Parameters:
+        cartesian_coords (tuple): A tuple or list of (x, y, z) Cartesian coordinates.
+    
+    Returns:
+        dict: A dictionary with cylindrical coordinates {'r': rho, 'phi': phi, 'z': z}.
+    """
+    x, y, z = cartesian_coords
+    
+    # Calculate the radial distance (rho)
+    rho = np.sqrt(x**2 + y**2)
+    
+    # Calculate the azimuthal angle (phi)
+    phi = np.arctan2(y, x)
+    
+    # The z-coordinate remains the same
+    z_cylindrical = z
+    
+    return {'r': rho, 'phi': phi, 'z': z_cylindrical}
+
+
+def multi_cycl(dictionary):
+    """
+    Converts the center of mass coordinates from Cartesian to cylindrical coordinates for multiple entries.
+    
+    Parameters:
+        dictionary (dict): Dictionary containing 'CoM' entries with Cartesian coordinates.
+    
+    Returns:
+        dict: Dictionary with the same keys as the input, containing cylindrical coordinates.
+    """
+    cyl = {}
+    
+    for name in dictionary.keys():
+        # Transpose the 'CoM' coordinates and convert to cylindrical
+        cartesian_coords = np.transpose(dictionary[name]['CoM'])
+        cyl[name] = cartesian_to_cylindrical(cartesian_coords)
+    
+    return cyl
+
+
+def read_pdb(pdbcode, pdbfilenm):
+    """
+    Read a PDB structure from a file.
+    
+    Parameters:
+        pdbcode (str): A personalized PDB ID string.
+        pdbfilenm (str): The path to the PDB file.
+        
+    Returns:
+        Bio.PDB.Structure.Structure or None: Parsed structure object or None if an error occurs.
+    """
+    try:
+        pdbparser = PDBParser(QUIET=True)   # suppress PDBConstructionWarning
+        struct = pdbparser.get_structure(pdbcode, pdbfilenm)
+        return struct  
+    except Exception as err:
+        print(f"Error parsing PDB file {pdbfilenm}: {err}", file=sys.stderr)
+        return None
+
+def read_(path, end):
+    """
+    Reads PDB files from a specified directory and stores them in a dictionary.
+    
+    Parameters:
+        path (str): Path to the base directory containing subdirectories with PDB files.
+        end (str): Subdirectory name within the base directory where PDB files are located.
+    
+    Returns:
+        dict: Dictionary with file base names as keys and corresponding processed PDB file data as values.
+    """
+    files = {}
+    
+    # Construct the full path to the PDB files
+    full_path = f"{path}/{end}/*.pdb"
+    
+    # Iterate over all PDB files in the specified directory
+    for filename in glob.glob(full_path):
+        # Extract the base name of the file (excluding directory path and file extension)
+        name = filename.split('/')[-1].split('_')[0]
+        
+        # Read the PDB file and store it in the dictionary
+        files[name] = read_pdb(name, filename)
+    
+    return files
+
+
+def chains_(struc):
+    """
+    Extracts alpha carbon ('CA') coordinates from residues in protein chains of a structure.
+
+    Parameters:
+        struc (Bio.PDB.Structure.Structure): A Biopython Structure object.
+
+    Returns:
+        dict: Dictionary where keys are chain IDs and values are DataFrames with 'x', 'y', 'z' coordinates indexed by residue number.
+    """
+    chain_d = {}
+
+    # Iterate over all chains in the structure
+    for chain in struc.get_chains():
+        number = []
+        coo = []
+        
+        try:
+            # Iterate over all residues in the chain
+            for residue in chain.get_residues():
+                # Iterate over all atoms in the residue
+                for atom in residue.get_atoms():
+                    # Check if the atom is an alpha carbon ('CA')
+                    if atom.name == 'CA':
+                        coo.append(atom.get_vector()[0:3])  # Get atom coordinates
+                        number.append(int(str(residue).split('=')[2].split(' ')[0]))  # Get residue number
+
+            # Create a DataFrame for the chain with coordinates and residue numbers
+            chain_d[chain.id] = pd.DataFrame(coo, index=number, columns=['x', 'y', 'z'])
+        
+        except PDBException as e:
+            print(f"Error processing chain {chain.id}: {e}", file=sys.stderr)
+            continue
+
+    return chain_d
+
+def multi_chains_(dictionary):
+    """
+    Extracts alpha carbon ('CA') coordinates from residues in protein chains for multiple structures.
+
+    Parameters:
+        dictionary (dict): Dictionary where keys are structure names and values are Biopython Structure objects.
+
+    Returns:
+        dict: Dictionary where keys are structure names and values are dictionaries from `chains_` function.
+    """
+    chain = {}
+
+    # Iterate over all structures in the dictionary
+    for struc_name, struc in dictionary.items():
+        # Extract chains and store in dictionary
+        chain[struc_name] = chains_(struc)
+
+    return chain
+
+def chain_coo(chains, alphabet, x):
+    """
+    Process chain coordinates to extract centers and helix directions.
+
+    Parameters:
+        chains (dict): Dictionary where keys are chain IDs and values are DataFrames with 'x', 'y', 'z' coordinates.
+        alphabet (list): List of chain IDs to process.
+        x (tuple): Tuple with two integers defining a range of residue numbers.
+
+    Returns:
+        dict: Dictionary with extracted properties:
+              - 'center': Centers of each chain - here gamma-Tubulin
+              - 'centerH': Centers of each chain within the specified residue range - here helix 12 in gamma-Tubulin
+              - 'helix': Normalized helix directions.
+              - 'df': Original DataFrames for each chain.
+    """
+    helixs = []
+    centers = []
+    centerH = []
+    dfs_ = {}
+
+    for i in alphabet:
+        df_ss = chains[i]
+        dfs_[i] = df_ss
+
+        # Calculate centers
+        origin = df_ss.mean()
+        centers.append(np.array(origin))
+
+        # Calculate center within specified range x
+        centerH.append(df_ss.loc[x[0]:x[1]].mean())
+
+        # Calculate helix direction
+        middle = abs((x[1] - x[0]) // 2)
+        deltas = df_ss.loc[x[0]:x[0] + middle].mean() - df_ss.loc[x[1] - middle:x[1]].mean()
+        norm = deltas / np.sqrt(np.sum(deltas**2))
+        helixs.append(np.array(norm))
+
+    return {'center': centers, 'centerH': centerH, 'helix': helixs, 'df': dfs_}
+
+def multi_chain_coo(dict_struct, dict_alpha, dict_x):
+    """
+    Process multiple protein structures to extract chain properties using chain_coo function.
+
+    Parameters:
+        dict_struct (dict): Dictionary where keys are structure names and values are dictionaries of chain DataFrames.
+        dict_alpha (dict): Dictionary where keys are structure names and values are lists of chain IDs.
+        dict_x (dict): Dictionary where keys are structure names and values are tuples defining residue ranges.
+
+    Returns:
+        dict: Dictionary where keys are structure names and values are dictionaries of extracted chain properties.
+              Each inner dictionary is from the chain_coo function.
+    """
+    multi_coo = {}
+    
+    # Iterate over each structure in dict_struct
+    for struc in dict_struct.keys():
+        # Extract chain properties using chain_coo function
+        multi_coo[struc] = chain_coo(dict_struct[struc], dict_alpha[struc], dict_x[struc])
+    
+    return multi_coo
+
+def distance(centers):
+    """
+    Compute distances between consecutive points in a list of centers and their cumulative distances.
+
+    Parameters:
+        centers (list of np.ndarray): List of center points, where each point is represented as a numpy array.
+
+    Returns:
+        dict: Dictionary containing 'dist' (array of individual distances) and 'cumdist' (array of cumulative distances).
+    """
+    dist_ = []
+    
+    # Calculate individual distances between consecutive points
+    for i in range(len(centers) - 1):
+        dist = np.sqrt(np.sum((centers[i + 1] - centers[i]) ** 2))
+        dist_.append(dist)
+    
+    # Calculate cumulative distances
+    cumdist_ = np.cumsum(dist_)
+    
+    return {'dist': np.array(dist_), 'cumdist': cumdist_}
+def cum_dist(dist):
+    """
+    Compute cumulative distances from a list of individual distances.
+
+    Parameters:
+        dist (list or np.ndarray): List or array of individual distances.
+
+    Returns:
+        list: Cumulative distances.
+    """
+    cumdist_ = [sum(dist[0:x]) for x in range(1, len(dist)+1)]
+    return cumdist_
+def multi_dist(dictionary, norm):
+    """
+    Compute distances and cumulative distances from centers of mass (CoM) for multiple chains in a protein structure dictionary.
+
+    Parameters:
+        dictionary (dict): Dictionary where keys are chain IDs and values are dictionaries containing 'center' arrays.
+        norm (str): Key in dictionary indicating the normalization chain.
+
+    Returns:
+        dict: Dictionary where keys are chain IDs and values are dictionaries containing 'CoM', 'dist', and 'cumdist2' arrays.
+    """
+    multiD = {}
+    C = 'center'
+    
+    # Iterate over each chain in the dictionary
+    for chainS in dictionary.keys():
+        df = {}
+        
+        # Calculate center of mass (CoM) relative to the normalization chain
+        df['CoM'] = dictionary[chainS][C] - np.mean(dictionary[norm][C], axis=0)
+        
+        # Calculate distances and cumulative distances
+        df['dist'] = distance(df['CoM'])
+        df['cumdist2'] = np.insert(df['dist']['cumdist'], 0, 0)
+        
+        # Store results in multiD dictionary
+        multiD[chainS] = df
+    
+    return multiD
+
+def sphere_coo(array, un_wrap):
+    """
+    Convert Cartesian coordinates to spherical coordinates.
+
+    Parameters:
+        array (np.ndarray): 2D array where each row represents Cartesian coordinates [x, y, z].
+        un_wrap (bool): Whether to unwrap angles theta and phi.
+
+    Returns:
+        pd.DataFrame: DataFrame with 'theta' (polar angle) and 'phi' (azimuthal angle).
+    """
+    # Calculate theta (polar angle)
+    theta = np.arccos(array[:, 2] / np.linalg.norm(array, axis=1))
+    
+    # Calculate phi (azimuthal angle)
+    phi = np.arctan2(array[:, 1], array[:, 0])
+    
+    # Optionally unwrap angles
+    if un_wrap:
+        theta = np.unwrap(theta)
+        phi = np.unwrap(phi)
+    
+    # Create DataFrame
+    df = pd.DataFrame({'theta': theta, 'phi': phi})
+    
+    return df
+def multi_sphere(dictionary, array, norm):
+    """
+    Perform operations on spherical coordinates derived from a dictionary of arrays.
+
+    Parameters:
+        dictionary (dict): Dictionary where keys are names and values are arrays.
+        array (str): Key in each entry of dictionary that contains the array of Cartesian coordinates.
+        norm (str): Key in dictionary that represents the normalization reference.
+
+    Returns:
+        defaultdict: Dictionary with spherical coordinates, normalization differences, and corrected coordinates.
+    """
+    sph_ = defaultdict(dict)
+    
+    # Iterate over each entry in the dictionary
+    for name in dictionary.keys():
+        for names in dictionary.keys():
+            # Convert Cartesian coordinates to spherical coordinates
+            sph_[names]['sph'] = sphere_coo(pd.DataFrame(dictionary[names][array]), True)
+        
+        # Calculate normalization differences
+        sph_[name]['norm'] = sph_[name]['sph'] - sph_[norm]['sph']
+        
+        # Apply correction function to azimuthal angle phi
+        sph_[name]['corr'] = phi_corr(sph_[name]['norm'])  # Assuming phi_corr is defined elsewhere
+        
+    return sph_
+def phi_corr(delta_s):
+    """
+    Correct azimuthal angles (phi) based on polar angles (theta) from spherical coordinates.
+
+    Parameters:
+        delta_s (pd.DataFrame): DataFrame with 'theta' (polar angle) and 'phi' (azimuthal angle).
+
+    Returns:
+        np.ndarray: Corrected azimuthal angles.
+    """
+    phicorr = delta_s['phi'].to_numpy().copy()  # Copy phi values to a numpy array
+    
+    # Correct phi based on theta
+    phicorr[delta_s['theta'] < 0] += np.pi
+    
+    return phicorr
+ 

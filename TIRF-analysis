@@ -1,0 +1,240 @@
+#this file contains functions for image processing and spot counts e.g. for TIRF data
+import numpy as np
+
+import matplotlib.pyplot as plt
+
+import cv2 as cv
+import nd2
+
+from skimage.feature import blob_log
+import os,glob 
+
+def bg_removal(data, blur, Fig):
+    """
+    Removes the background from the provided image data using erosion and Gaussian blur techniques.
+    
+    Parameters:
+        data (np.ndarray): Input image data.
+        blur (int): Kernel size for erosion and Gaussian blur.
+        Fig (bool): If True, prints the intermediate steps.
+
+    Returns:
+        dict: Dictionary containing background, background removed image, normalized background removed image, and normalized input image.
+    """
+    # Initialize output array with the same shape as input data
+    out = np.zeros(data.shape, dtype=np.uint8)
+    
+    # Normalize the data to the range [0, 255]
+    normMT = cv.normalize(data, out, 0, 255, cv.NORM_MINMAX)
+    normMT = np.uint8(normMT)
+    
+    # Create the background using erosion and Gaussian blur
+    kernel = np.ones((blur, blur), dtype=np.uint8)
+    bg = cv.erode(normMT, kernel)
+    bg = cv.GaussianBlur(bg, (blur, blur), 0)
+    
+    # Subtract the background from the normalized image
+    bgrm = cv.subtract(normMT, bg)
+    
+    # Normalize the background removed image to limit pixel values
+    normbgrm = np.where(bgrm > 20, 20, bgrm)
+    
+    # Optionally display the figures
+    if Fig:
+        print_bg(normMT, bg, bgrm)
+    
+    # Return results as a dictionary
+    return {
+        'bg': bg,
+        'bgrm': bgrm,
+        'normbgrm': normbgrm,
+        'norm': normMT
+    }
+
+
+def print_bg(normMT, bg, bgrm):
+    """
+    Displays the normalized input image, background image, and background removed image side by side.
+    
+    Parameters:
+        normMT (np.ndarray): Normalized input image.
+        bg (np.ndarray): Background image.
+        bgrm (np.ndarray): Background removed image.
+    """
+    # Create a subplot with 1 row and 3 columns, sharing x and y axes
+    fig, axes = plt.subplots(1, 3, figsize=(9, 3), sharex=True, sharey=True)
+    ax = axes.ravel()
+    
+    # Display the normalized input image
+    ax[0].imshow(normMT, vmin=0, vmax=6 * normMT.mean())
+    ax[0].set_title('Original')
+    ax[0].axis('off')
+    
+    # Display the background image
+    ax[1].imshow(bg, cmap='gray')
+    ax[1].set_title('Background')
+    ax[1].axis('off')
+    
+    # Display the background removed image
+    ax[2].imshow(bgrm, vmin=0, vmax=6 * normMT.mean())
+    ax[2].set_title('Background Removed')
+    ax[2].axis('off')
+    
+    # Adjust layout and show the plot
+    plt.tight_layout()
+    plt.show()
+    
+    # Print statistics of the background removed image
+    print('Mean:', bgrm.mean(), 'Min:', bgrm.min(), 'Max:', bgrm.max())
+    
+    return
+
+
+def count_gTurc(image_gray, thresh, Fig, name):
+    """
+    Detects spots in a grayscale image using the Laplacian of Gaussian (LoG) method.
+    
+    Parameters:
+        image_gray (np.ndarray): Grayscale input image.
+        thresh (float): Threshold for blob detection.
+        Fig (bool): If True, displays the spots on the image.
+        name (str): Title for the figure when displaying spots.
+    
+    Returns:
+        np.ndarray: Array of detected blobs, each represented by (y, x, r) where
+                    (y, x) are the coordinates and r is the radius.
+    """
+    # Detect blobs using the Laplacian of Gaussian (LoG) method
+    blobs_log = blob_log(image_gray, min_sigma=1, max_sigma=5, num_sigma=5, 
+                         threshold=0.003 * image_gray.mean(), overlap=0.01)
+    blobs_log[:, 2] = blobs_log[:, 2] * np.sqrt(2)
+    
+    # Optionally display the spots
+    if Fig:
+        print_spots(image_gray, blobs_log, name)
+    
+    return blobs_log
+
+def print_spots(image_gray, blobs_log, name):
+    """
+    Displays the detected spots on the grayscale image and plots histograms of the GFP signal and spot radii.
+    
+    Parameters:
+        image_gray (np.ndarray): Grayscale input image.
+        blobs_log (np.ndarray): Array of detected blobs.
+        name (str): Title for the figure.
+    """
+    # Create subplots
+    fig, axes = plt.subplots(1, 3, figsize=(9, 3))
+    ax = axes.ravel()
+    
+    # Display the grayscale image with detected spots
+    ax[0].set_title(name)
+    ax[0].imshow(image_gray, vmin=0, vmax=image_gray.mean() * 4)
+    for blob in blobs_log:
+        y, x, r = blob
+        c = plt.Circle((x, y), r, color='yellow', linewidth=1, fill=False)
+        ax[0].add_patch(c)
+    ax[0].axis('off')
+    
+    # Plot histogram of GFP signals at blob locations
+    ax[1].hist(image_gray[blobs_log[:, 0].astype(int), blobs_log[:, 1].astype(int)], 
+               bins=40, range=[0, 100], histtype='barstacked')
+    ax[1].set_xlabel('GFP-Signal')
+    ax[1].set_ylabel('#Spots')
+    
+    # Plot histogram of spot radii
+    ax[2].hist(blobs_log[:, 2], bins=40, range=[0, 5], histtype='barstacked')
+    ax[2].set_xlabel('Spot radius')
+    ax[2].set_ylabel('#Spots')
+    
+    # Adjust layout and show the plot
+    plt.tight_layout()
+    plt.show()
+    
+    # Print the shape of the detected blobs array
+    print(f'Number of detected blobs: {blobs_log.shape[0]}')
+
+# Example usage (assuming necessary imports and image data are available)
+# blobs_log = count_gTurc(image_gray, thresh=0.003, Fig=True, name='Detected Spots')
+
+def GFP_channel(data, blur, thresh, Fig, name):
+    """
+    Processes the GFP channel by removing the background and counting spots.
+    
+    Parameters:
+        data (np.ndarray): Input image data.
+        blur (int): Kernel size for background removal.
+        thresh (float): Threshold for spot detection.
+        Fig (bool): If True, displays intermediate and final figures.
+        name (str): Title for the figure when displaying spots.
+    
+    Returns:
+        dict: Dictionary containing the background removal results, detected spots, and the count of spots.
+    """
+    # Perform background removal
+    bgrm = bg_removal(data, blur, Fig)
+    
+    # Detect spots in the background removed image
+    spots = count_gTurc(bgrm['bgrm'], thresh, Fig, name)
+    
+    # Return results as a dictionary
+    return {
+        'bgrm': bgrm,
+        'spots': spots,
+        'spot-count': spots.shape[0]
+    }
+
+# Example usage (assuming necessary imports, definitions, and image data are available)
+# results = GFP_channel(data, blur=5, thresh=0.003, Fig=True, name='Detected GFP Spots')
+
+def read_(path):
+    """
+    Reads .nd2 image files from the specified directory and stores them in a dictionary.
+
+    Parameters:
+        path (str): Path to the directory containing .nd2 image files.
+
+    Returns:
+        dict: Dictionary with file base names as keys and corresponding image data as values.
+    """
+    files = {}
+    # Iterate over all .nd2 files in the specified directory
+    for filename in glob.glob(f"{path}/*im.nd2"):
+        # Extract the base name of the file (excluding directory path and file extension)
+        name = filename.split('/')[-1].split('i')[0]
+        # Read the .nd2 file and store it in the dictionary
+        files[name] = nd2.imread(filename)
+    
+    return files
+
+def MS(data, blur, thresh, Fig, channel):
+    """
+    Processes multiple image stacks to detect GFP spots in each frame of each stack.
+    
+    Parameters:
+        data (dict): Dictionary with image stacks, where keys are names and values are 4D numpy arrays.
+        blur (int): Kernel size for background removal.
+        thresh (float): Threshold for spot detection.
+        Fig (bool): If True, displays intermediate and final figures.
+        channel (int): Index of the GFP channel in the image stack.
+    
+    Returns:
+        dict: Dictionary containing detected spots for each image stack and frame.
+    """
+    spots = {}
+
+    # Iterate over each image stack in the data dictionary
+    for name in data:
+        dat = data[name]
+        
+        # Process each frame in the image stack
+        for i in range(dat.shape[0]):
+            # Extract the specified channel (GFP) from the current frame
+            gfp = dat[i][channel, :, :]
+            
+            # Detect spots in the GFP channel and store the result
+            spots[f'{name}_{i}'] = GFP_channel(gfp, blur, thresh, Fig, name)
+    
+    return spots
+
